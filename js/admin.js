@@ -1,15 +1,16 @@
 /* ==========================================================================
    ADMIN.JS - Xử lý toàn bộ trang Admin:
-   Quản lý file / Quản lý user / Upload / Lịch sử / Thảo luận
+   Quản lý file / Quản lý Hashtag / Quản lý user / Upload / Lịch sử / Thảo luận
    Dùng cho: html/admin.html
    Phụ thuộc: js/config.js, js/comment.js (nhúng TRƯỚC file này)
    ========================================================================== */
 
 // ---------- 1. TRẠNG THÁI DÙNG CHUNG TOÀN FILE ----------
-let currentUser = null; // { id, name, isAdmin, isSuperAdmin }
-let folderList = [];    // cache folder (dùng cho Upload + đổi folder)
-let allFiles = [];      // cache toàn bộ file (Quản lý file)
-let allUsers = [];      // cache toàn bộ user (Quản lý user)
+const BUCKET_NAME = "documents";
+let currentUser = null;
+let hashtagListAdmin = [];
+let allFiles = [];
+let allUsers = [];
 let toastTimer;
 
 const elSidebar = document.getElementById("sidebar");
@@ -17,7 +18,7 @@ const elBreadcrumbCurrent = document.getElementById("breadcrumbCurrent");
 const elUserNameLabel = document.getElementById("userNameLabel");
 const elUserAvatar = document.getElementById("userAvatar");
 
-// ---------- 2. KHỞI CHẠY TRANG (auth guard + tải dữ liệu ban đầu) ----------
+// ---------- 2. KHỞI CHẠY TRANG ----------
 bootstrapAdminPage();
 
 async function bootstrapAdminPage() {
@@ -33,15 +34,9 @@ async function bootstrapAdminPage() {
     .eq("id", session.user.id)
     .single();
 
-  if (error || !profile || !profile.status) {
+  if (error || !profile || !profile.status || !profile.is_admin) {
     await supabaseClient.auth.signOut();
     window.location.href = "login.html";
-    return;
-  }
-
-  // Không phải Admin thì không được vào trang này
-  if (!profile.is_admin) {
-    window.location.href = "user.html";
     return;
   }
 
@@ -57,7 +52,7 @@ async function bootstrapAdminPage() {
   elUserAvatar.textContent = currentUser.name.slice(0, 2).toUpperCase();
 
   initThemeToggle(profile.color);
-  await loadFolders();
+  await loadHashtagsAdmin();
   await loadFiles();
   await loadUsers();
   await loadHistory();
@@ -67,7 +62,7 @@ async function bootstrapAdminPage() {
   restorePageFromHash();
 }
 
-// ---------- 3. ĐIỀU HƯỚNG GIỮA CÁC TAB ----------
+// ---------- 3. ĐIỀU HƯỚNG ----------
 document.addEventListener("click", (event) => {
   const nav = event.target.closest("[data-page]");
   if (nav) switchPage(nav.dataset.page);
@@ -84,10 +79,10 @@ document.getElementById("logoutBtn").addEventListener("click", async () => {
 
 const pageTitles = {
   files: "Quản lý file",
-  folders: "Quản lý folder",
+  hashtags: "Quản lý Hashtag",
   users: "Quản lý user",
-  upload: "Upload",
   leaderboard: "Bảng xếp hạng",
+  upload: "Upload",
   history: "Lịch sử",
   discussion: "Thảo luận",
   settings: "Cài đặt",
@@ -103,13 +98,11 @@ function switchPage(page) {
   elBreadcrumbCurrent.textContent = pageTitles[page];
   elSidebar.classList.remove("open");
 
-  // Ghi nhớ tab đang mở vào URL -> F5 lại vẫn giữ đúng tab, không nhảy về tab đầu
   if (window.location.hash !== `#${page}`) {
     history.replaceState(null, "", `#${page}`);
   }
 }
 
-// Khôi phục lại đúng tab đã mở trước đó (dựa vào URL hash) sau khi bootstrap xong
 function restorePageFromHash() {
   const savedPage = window.location.hash.replace("#", "");
   if (savedPage && pageTitles[savedPage]) {
@@ -126,9 +119,7 @@ document.getElementById("fileSearchInput").addEventListener("input", renderFileT
 async function loadFiles() {
   const { data, error } = await supabaseClient
     .from("file")
-    .select(
-      "id, file_name, storage_path, status, created_at, id_folder, id_user, folder:id_folder(display_name, parent:parent_id(display_name)), user:id_user(user_name)"
-    )
+    .select("id, file_name, storage_path, status, created_at, id_user, user:id_user(user_name), file_hashtag(hashtag:id_hashtag(name))")
     .order("created_at", { ascending: false });
 
   if (error) {
@@ -140,33 +131,14 @@ async function loadFiles() {
   renderFileTable();
 }
 
-// Hiện đường dẫn folder dạng "Cha / Con" nếu là folder con, chỉ tên nếu là folder gốc
-function formatFolderPath(file) {
-  const subName = file.folder?.display_name || "-";
-  const parentName = file.folder?.parent?.display_name;
-  return parentName ? `${parentName} / ${subName}` : subName;
-}
-
 function renderFileTable() {
-  const rawKeyword = document.getElementById("fileSearchInput").value.trim().toLowerCase();
-  let list;
+  const rawKeyword = document.getElementById("fileSearchInput").value.trim().toLowerCase().replace(/^#/, "");
 
-  if (rawKeyword.includes("/")) {
-    // Cú pháp đặc biệt "Tên folder cha/Tên folder con" -> tìm chính xác đúng cặp cha-con
-    const [parentPart, subPart] = rawKeyword.split("/").map((s) => s.trim());
-    list = allFiles.filter((file) => {
-      const parentName = (file.folder?.parent?.display_name || "").toLowerCase();
-      const subName = (file.folder?.display_name || "").toLowerCase();
-      return parentName.includes(parentPart) && subName.includes(subPart || "");
-    });
-  } else {
-    list = allFiles.filter((file) => {
-      const subName = file.folder?.display_name || "";
-      const parentName = file.folder?.parent?.display_name || "";
-      const haystack = `${file.id} ${file.file_name} ${file.user?.user_name || ""} ${subName} ${parentName}`.toLowerCase();
-      return haystack.includes(rawKeyword);
-    });
-  }
+  const list = allFiles.filter((file) => {
+    const tagsText = (file.file_hashtag || []).map(fh => fh.hashtag?.name || "").join(" ").toLowerCase();
+    const haystack = `${file.id} ${file.file_name} ${file.user?.user_name || ""} ${tagsText}`.toLowerCase();
+    return haystack.includes(rawKeyword);
+  });
 
   document.getElementById("fileResultCount").textContent = list.length;
   document.getElementById("fileEmptyState").hidden = list.length > 0;
@@ -182,11 +154,15 @@ function renderFileRow(file) {
     ? `<span class="status active">Hoạt động</span>`
     : `<span class="status inactive">Đã xóa mềm</span>`;
 
+  const tagsHtml = (file.file_hashtag || [])
+    .map(fh => fh.hashtag?.name ? `<span class="badge">#${escapeHTML(fh.hashtag.name)}</span>` : '')
+    .join(' ') || '-';
+
   return /* html */ `
     <tr data-file-id="${file.id}" data-storage-path="${escapeAttr(file.storage_path)}" data-status="${file.status}">
-      <td>#${file.id}</td>
+      <td>#${file.id.slice(0, 8)}...</td>
       <td>${escapeHTML(file.file_name)}</td>
-      <td>${escapeHTML(formatFolderPath(file))}</td>
+      <td>${tagsHtml}</td>
       <td>${escapeHTML(file.user?.user_name || "-")}</td>
       <td>${statusHtml}</td>
       <td>${formatDate(file.created_at)}</td>
@@ -195,7 +171,6 @@ function renderFileRow(file) {
           <button class="action-btn" data-view-file title="Xem">👁</button>
           <button class="action-btn" data-download-file title="Tải về">⬇</button>
           <button class="action-btn" data-rename-file title="Đổi tên">✎</button>
-          <button class="action-btn" data-move-file title="Đổi folder">📁</button>
           <button class="action-btn" data-toggle-status="${file.status}" title="${file.status ? "Ẩn file" : "Hiện lại file"}">${file.status ? "🚫" : "↺"}</button>
           <button class="action-btn delete" data-purge-file title="Xóa vĩnh viễn">⌫</button>
         </div>
@@ -217,7 +192,6 @@ function attachFileRowEvents(container) {
       openFileUrl(storagePath, true, newTab);
     });
     row.querySelector("[data-rename-file]")?.addEventListener("click", () => renameFile(fileId, row));
-    row.querySelector("[data-move-file]")?.addEventListener("click", () => openMoveFolderModal(fileId));
     const toggleBtn = row.querySelector("[data-toggle-status]");
     if (toggleBtn) {
       const currentStatus = toggleBtn.dataset.toggleStatus === "true";
@@ -274,45 +248,6 @@ async function renameFile(fileId, row) {
   await loadFiles();
 }
 
-let movingFileId = null;
-
-function openMoveFolderModal(fileId) {
-  movingFileId = fileId;
-  const select = document.getElementById("moveFolderSelect");
-  select.innerHTML = buildFolderOptionsHTML();
-  document.getElementById("moveFolderModal").classList.add("open");
-}
-
-function closeMoveFolderModal() {
-  document.getElementById("moveFolderModal").classList.remove("open");
-  movingFileId = null;
-}
-
-document.querySelectorAll("[data-close-move-modal]").forEach((el) => {
-  el.addEventListener("click", closeMoveFolderModal);
-});
-
-document.getElementById("moveFolderConfirmBtn").addEventListener("click", async () => {
-  if (!movingFileId) return;
-  const newFolderId = document.getElementById("moveFolderSelect").value;
-  const target = folderList.find((f) => f.id === newFolderId);
-
-  const { error } = await supabaseClient
-    .from("file")
-    .update({ id_folder: newFolderId, updated_at: new Date().toISOString() })
-    .eq("id", movingFileId);
-
-  if (error) {
-    showToast("Không đổi được folder", error.message);
-    return;
-  }
-
-  await logHistory(movingFileId, "Đã sửa");
-  showToast("Đã chuyển folder", `Chuyển sang "${target?.display_name}"`);
-  closeMoveFolderModal();
-  await loadFiles();
-});
-
 async function toggleFileStatus(fileId, currentStatus) {
   const newStatus = !currentStatus;
   const { error } = await supabaseClient.from("file").update({ status: newStatus }).eq("id", fileId);
@@ -326,24 +261,19 @@ async function toggleFileStatus(fileId, currentStatus) {
 async function purgeFile(fileId) {
   const file = allFiles.find((f) => f.id === fileId);
   if (!file) return;
-  if (!confirm(`XÓA VĨNH VIỄN file "${file.file_name}"? Không thể hoàn tác, kể cả lịch sử liên quan cũng sẽ mất.`)) return;
+  if (!confirm(`XÓA VĨNH VIỄN file "${file.file_name}"?`)) return;
 
   try {
-    // 1) Xóa các dòng lịch sử đang tham chiếu tới file này trước
-    //    (DB chưa cấu hình tự xóa cascade, phải xóa tay để tránh lỗi khóa ngoại)
-    const { error: historyError } = await supabaseClient.from("history_file").delete().eq("id_file", fileId);
-    if (historyError) throw historyError;
+    await supabaseClient.from("history_file").delete().eq("id_file", fileId);
 
-    // 2) Xóa file vật lý khỏi Storage
     const bucketName = file.storage_path.split("/")[0];
     const pathInsideBucket = file.storage_path.split("/").slice(1).join("/");
     await supabaseClient.storage.from(bucketName).remove([pathInsideBucket]);
 
-    // 3) Xóa dòng dữ liệu file
     const { error } = await supabaseClient.from("file").delete().eq("id", fileId);
     if (error) throw error;
 
-    showToast("Đã xóa vĩnh viễn", `File "${file.file_name}" và lịch sử liên quan đã bị xóa.`);
+    showToast("Đã xóa vĩnh viễn", `File "${file.file_name}" đã bị xóa.`);
     await loadFiles();
     await loadHistory();
     await loadLeaderboard();
@@ -354,6 +284,101 @@ async function purgeFile(fileId) {
 
 async function logHistory(fileId, change) {
   await supabaseClient.from("history_file").insert({ id_file: fileId, id_user: currentUser.id, change });
+}
+
+// ==========================================================================
+// TAB: QUẢN LÝ HASHTAG
+// ==========================================================================
+
+async function loadHashtagsAdmin() {
+  const { data, error } = await supabaseClient
+    .from("hashtag")
+    .select("id, name, created_at")
+    .order("name");
+
+  if (error) return showToast("Không tải được Hashtag", error.message);
+
+  hashtagListAdmin = data || [];
+  renderHashtagManageList();
+}
+
+function renderHashtagManageList() {
+  const body = document.getElementById("hashtagManageBody");
+  if (!body) return;
+
+  body.innerHTML = hashtagListAdmin.map((h) => /* html */ `
+    <tr data-hashtag-id="${h.id}">
+      <td><strong>#${escapeHTML(h.name)}</strong></td>
+      <td>${formatDate(h.created_at)}</td>
+      <td>
+        <div class="actions">
+          <button class="action-btn" data-edit-hashtag="${h.id}" title="Sửa tên">✎</button>
+          <button class="action-btn delete" data-delete-hashtag="${h.id}" title="Xóa">⌫</button>
+        </div>
+      </td>
+    </tr>
+  `).join("");
+
+  body.querySelectorAll("[data-edit-hashtag]").forEach((btn) => {
+    btn.addEventListener("click", () => handleEditHashtag(btn.dataset.editHashtag));
+  });
+  body.querySelectorAll("[data-delete-hashtag]").forEach((btn) => {
+    btn.addEventListener("click", () => handleDeleteHashtag(btn.dataset.deleteHashtag));
+  });
+}
+
+document.getElementById("hashtagForm")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const submitBtn = document.getElementById("hashtagSubmitBtn");
+  const input = document.getElementById("hashtagName");
+  const tagName = input.value.trim().replace(/^#/, "");
+
+  if (!tagName) return;
+  submitBtn.disabled = true;
+
+  const { error } = await supabaseClient.from("hashtag").insert({
+    name: tagName,
+    created_by: currentUser.id
+  });
+
+  submitBtn.disabled = false;
+  if (error) return showToast("Không tạo được Hashtag", error.message);
+
+  showToast("Đã tạo Hashtag mới", `#${tagName}`);
+  input.value = "";
+  await loadHashtagsAdmin();
+});
+
+async function handleEditHashtag(hashtagId) {
+  const tag = hashtagListAdmin.find((h) => h.id === hashtagId);
+  const newName = prompt("Nhập tên Hashtag mới (không nhập dấu #):", tag?.name || "");
+  const cleanName = (newName || "").trim().replace(/^#/, "");
+
+  if (!cleanName || cleanName === tag?.name) return;
+
+  const { error } = await supabaseClient
+    .from("hashtag")
+    .update({ name: cleanName })
+    .eq("id", hashtagId);
+
+  if (error) return showToast("Không đổi tên được", error.message);
+
+  showToast("Đã cập nhật Hashtag", `#${cleanName}`);
+  await loadHashtagsAdmin();
+  await loadFiles();
+}
+
+async function handleDeleteHashtag(hashtagId) {
+  const tag = hashtagListAdmin.find((h) => h.id === hashtagId);
+  if (!confirm(`Xóa Hashtag #${tag?.name}? Các file đang gắn hashtag này sẽ bị gỡ thẻ.`)) return;
+
+  const { error } = await supabaseClient.from("hashtag").delete().eq("id", hashtagId);
+
+  if (error) return showToast("Không xóa được Hashtag", error.message);
+
+  showToast("Đã xóa Hashtag", "");
+  await loadHashtagsAdmin();
+  await loadFiles();
 }
 
 // ==========================================================================
@@ -375,7 +400,6 @@ async function loadUsers() {
   renderUserTable();
 }
 
-// Đếm tổng số file (kể cả đang ẩn) mỗi user đã từng upload, hiện trong bảng Quản lý user
 async function loadUserFileCounts() {
   const results = await Promise.all(
     allUsers.map(async (u) => {
@@ -414,9 +438,7 @@ function renderUserRow(user) {
 
   const isSelf = user.id === currentUser.id;
   const canManageRole = currentUser.isSuperAdmin && !isSelf && !user.is_super_admin;
-  const canDelete = !isSelf && !user.is_super_admin &&
-    (currentUser.isSuperAdmin || !user.is_admin); // Admin thường chỉ xóa User thường
-  // Duyệt/Khóa: Admin thường chỉ thao tác được với User thường; Super Admin thao tác được với mọi người (trừ chính mình)
+  const canDelete = !isSelf && !user.is_super_admin && (currentUser.isSuperAdmin || !user.is_admin);
   const canToggleStatus = !isSelf && (currentUser.isSuperAdmin || !user.is_admin);
 
   return /* html */ `
@@ -473,7 +495,7 @@ async function toggleAdmin(userId, row) {
 }
 
 async function deleteUser(userId) {
-  if (!confirm("Xóa VĨNH VIỄN tài khoản này? Sẽ xóa cả quyền đăng nhập lẫn hồ sơ, không thể hoàn tác.")) return;
+  if (!confirm("Xóa VĨNH VIỄN tài khoản này?")) return;
 
   const { data, error } = await supabaseClient.functions.invoke("delete-user", {
     body: { userId },
@@ -488,215 +510,10 @@ async function deleteUser(userId) {
 }
 
 // ==========================================================================
-// TAB: UPLOAD (logic giống hệt bên User)
+// TAB: UPLOAD (DÙNG CHUNG BUCKET DOCUMENTS)
 // ==========================================================================
 
 document.getElementById("uploadForm").addEventListener("submit", handleUpload);
-
-async function loadFolders() {
-  const { data, error } = await supabaseClient
-    .from("folder")
-    .select("id, display_name, bucket_name, parent_id")
-    .order("display_name");
-
-  if (error) return showToast("Không tải được folder", error.message);
-
-  folderList = data || [];
-
-  const select = document.getElementById("uploadFolder");
-  const roots = folderList.filter((f) => !f.parent_id);
-  select.innerHTML =
-    `<option value="">-- Chọn folder --</option>` +
-    roots.map((f) => `<option value="${f.id}">${escapeHTML(f.display_name)}</option>`).join("");
-  document.getElementById("uploadSubfolderWrap").hidden = true;
-
-  renderFolderManageList();
-  refreshFolderParentSelect();
-}
-
-// Khi đổi Folder cha ở tab Upload -> hiện thêm ô Folder con NẾU folder đó có con
-document.getElementById("uploadFolder").addEventListener("change", (event) => {
-  const parentId = event.target.value;
-  const wrap = document.getElementById("uploadSubfolderWrap");
-  const select = document.getElementById("uploadSubfolder");
-  const subfolders = folderList.filter((f) => f.parent_id === parentId);
-
-  if (!parentId || subfolders.length === 0) {
-    wrap.hidden = true;
-    select.value = "";
-    return;
-  }
-
-  select.innerHTML =
-    `<option value="">-- Không, để ở folder cha --</option>` +
-    subfolders.map((f) => `<option value="${f.id}">${escapeHTML(f.display_name)}</option>`).join("");
-  wrap.hidden = false;
-});
-
-// Xây danh sách option cho dropdown, folder con thụt vào để phân biệt với folder cha
-function buildFolderOptionsHTML() {
-  const roots = folderList.filter((f) => !f.parent_id);
-  let html = "";
-  roots.forEach((root) => {
-    html += `<option value="${root.id}">${escapeHTML(root.display_name)}</option>`;
-    folderList
-      .filter((f) => f.parent_id === root.id)
-      .forEach((sub) => {
-        html += `<option value="${sub.id}">— ${escapeHTML(sub.display_name)}</option>`;
-      });
-  });
-  return html;
-}
-
-// Đổ danh sách folder GỐC vào ô "Folder cha (tùy chọn)" trong form thêm folder
-function refreshFolderParentSelect() {
-  const select = document.getElementById("folderParentSelect");
-  if (!select) return;
-  const roots = folderList.filter((f) => !f.parent_id);
-  select.innerHTML =
-    `<option value="">-- Không có, đây là folder gốc --</option>` +
-    roots.map((f) => `<option value="${f.id}">${escapeHTML(f.display_name)}</option>`).join("");
-}
-
-// ---------- Quản lý Folder (thêm / xóa) ----------
-document.getElementById("folderForm").addEventListener("submit", handleAddFolder);
-
-function renderFolderManageList() {
-  const body = document.getElementById("folderManageBody");
-  const roots = folderList.filter((f) => !f.parent_id);
-
-  let html = "";
-  roots.forEach((root) => {
-    html += renderFolderManageRow(root, false);
-    folderList.filter((f) => f.parent_id === root.id).forEach((sub) => {
-      html += renderFolderManageRow(sub, true);
-    });
-  });
-  body.innerHTML = html;
-
-  body.querySelectorAll("[data-edit-folder]").forEach((btn) => {
-    btn.addEventListener("click", () => handleEditFolder(btn.dataset.editFolder));
-  });
-  body.querySelectorAll("[data-delete-folder]").forEach((btn) => {
-    btn.addEventListener("click", () => handleDeleteFolder(btn.dataset.deleteFolder));
-  });
-}
-
-function renderFolderManageRow(f, isSub) {
-  return /* html */ `
-      <tr data-folder-id="${f.id}">
-        <td>${isSub ? "— " : ""}${escapeHTML(f.display_name)}</td>
-        <td>${escapeHTML(f.bucket_name)}</td>
-        <td>
-          <div class="actions">
-            <button class="action-btn" data-edit-folder="${f.id}" title="Sửa tên">✎</button>
-            <button class="action-btn delete" data-delete-folder="${f.id}" title="Xóa">⌫</button>
-          </div>
-        </td>
-      </tr>`;
-}
-
-async function handleEditFolder(folderId) {
-  const folder = folderList.find((f) => f.id === folderId);
-  const newName = prompt("Nhập tên hiển thị mới cho folder:", folder?.display_name || "");
-  if (!newName || newName.trim() === "" || newName === folder?.display_name) return;
-
-  const { error } = await supabaseClient
-    .from("folder")
-    .update({ display_name: newName.trim() })
-    .eq("id", folderId);
-
-  if (error) return showToast("Không đổi được tên folder", error.message);
-
-  showToast("Đã đổi tên folder", "");
-  await loadFolders();
-}
-
-async function handleAddFolder(event) {
-  event.preventDefault();
-  const submitBtn = document.getElementById("folderSubmitBtn");
-  const displayName = document.getElementById("folderDisplayName").value.trim();
-  const parentId = document.getElementById("folderParentSelect")?.value || null;
-  if (!displayName) return;
-
-  submitBtn.disabled = true;
-  submitBtn.textContent = "Đang tạo...";
-
-  try {
-    if (parentId) {
-      // Folder CON: dùng chung bucket với folder cha, không cần tạo bucket mới
-      const parentFolder = folderList.find((f) => f.id === parentId);
-      const { error } = await supabaseClient.from("folder").insert({
-        display_name: displayName,
-        bucket_name: parentFolder.bucket_name,
-        parent_id: parentId,
-        created_by: currentUser.id,
-      });
-      if (error) throw error;
-
-      showToast("Đã thêm folder con", `"${displayName}" đã sẵn sàng để upload.`);
-    } else {
-      // Folder GỐC: cần tạo bucket thật riêng
-      const bucketName = slugify(displayName);
-      if (!bucketName) throw new Error("Tên hiển thị không hợp lệ, vui lòng nhập tên khác.");
-
-      const { data: bucketResult, error: bucketError } = await supabaseClient.functions.invoke("create-bucket", {
-        body: { bucketName },
-      });
-      if (bucketError) throw bucketError;
-      if (bucketResult?.error) throw new Error(bucketResult.error);
-
-      const { error } = await supabaseClient
-        .from("folder")
-        .insert({ display_name: displayName, bucket_name: bucketName, created_by: currentUser.id });
-      if (error) throw error;
-
-      showToast("Đã thêm folder", `"${displayName}" đã sẵn sàng để upload (đã tự tạo bucket "${bucketName}").`);
-    }
-
-    document.getElementById("folderForm").reset();
-    await loadFolders();
-  } catch (error) {
-    showToast("Không thêm được folder", error.message);
-  } finally {
-    submitBtn.disabled = false;
-    submitBtn.textContent = "+ Thêm folder";
-  }
-}
-
-// Chuyển tên tiếng Việt có dấu -> dạng "slug" hợp lệ để đặt tên bucket (vd: "Kế Toán" -> "ke-toan")
-function slugify(text) {
-  return text
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/đ/g, "d")
-    .replace(/Đ/g, "D")
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-async function handleDeleteFolder(folderId) {
-  const folder = folderList.find((f) => f.id === folderId);
-  const hasChildren = !folder?.parent_id && folderList.some((f) => f.parent_id === folderId);
-  const warning = hasChildren ? " Folder con bên trong cũng sẽ bị xóa theo." : "";
-
-  if (!confirm(`Xóa folder này? Chỉ xóa được nếu folder (và folder con, nếu có) không còn chứa file nào.${warning}`))
-    return;
-
-  const { error } = await supabaseClient.from("folder").delete().eq("id", folderId);
-
-  if (error) {
-    // Lỗi khóa ngoại xảy ra khi folder vẫn còn file bên trong tham chiếu tới
-    if (error.message.includes("foreign key") || error.message.includes("violates"))
-      return showToast("Không xóa được", "Folder này vẫn còn chứa file, hãy xóa/chuyển hết file trước.");
-    return showToast("Không xóa được folder", error.message);
-  }
-
-  showToast("Đã xóa folder", "");
-  await loadFolders();
-}
 
 async function handleUpload(event) {
   event.preventDefault();
@@ -705,43 +522,54 @@ async function handleUpload(event) {
   submitBtn.textContent = "Đang tải lên...";
 
   try {
-    // Nếu có chọn Folder con -> upload vào đó; không thì upload vào Folder cha
-    const parentFolderId = document.getElementById("uploadFolder").value;
-    const subfolderId = document.getElementById("uploadSubfolder").value;
-    const folderId = subfolderId || parentFolderId;
-    const folder = folderList.find((f) => f.id === folderId);
     const rawFile = document.getElementById("uploadFile").files[0];
     const bio = document.getElementById("uploadBio").value.trim();
+    const rawHashtags = document.getElementById("uploadHashtags").value;
     let displayName = document.getElementById("uploadName").value.trim() || rawFile.name;
 
-    if (!folder) throw new Error("Vui lòng chọn folder.");
-    if (!rawFile) throw new Error("Vui lòng chọn file để tải lên.");
+    if (!rawFile) throw new Error("Vui lòng chọn file.");
 
-    displayName = await resolveDuplicateName(displayName, folderId);
+    const tagNames = [...new Set(rawHashtags.split(",").map(t => t.trim().replace(/^#/, "")).filter(Boolean))];
+    if (tagNames.length === 0) throw new Error("Vui lòng nhập ít nhất 1 Hashtag (cách nhau bởi dấu phẩy).");
 
     const safeExt = rawFile.name.includes(".") ? rawFile.name.split(".").pop() : "";
     const storageFileName = `${crypto.randomUUID()}${safeExt ? "." + safeExt : ""}`;
-    const storagePath = `${folder.bucket_name}/${currentUser.id}/${storageFileName}`;
+    const storagePath = `${BUCKET_NAME}/${currentUser.id}/${storageFileName}`;
     const pathInsideBucket = `${currentUser.id}/${storageFileName}`;
 
     const { error: uploadError } = await supabaseClient.storage
-      .from(folder.bucket_name)
+      .from(BUCKET_NAME)
       .upload(pathInsideBucket, rawFile);
     if (uploadError) throw uploadError;
 
     const { data: newFile, error: insertError } = await supabaseClient
       .from("file")
-      .insert({ file_name: displayName, storage_path: storagePath, id_folder: folderId, id_user: currentUser.id, bio })
+      .insert({ file_name: displayName, storage_path: storagePath, id_user: currentUser.id, bio })
       .select()
       .single();
     if (insertError) throw insertError;
 
+    for (const tagName of tagNames) {
+      let { data: tag } = await supabaseClient.from("hashtag").select("id").eq("name", tagName).single();
+      if (!tag) {
+        const { data: createdTag } = await supabaseClient
+          .from("hashtag")
+          .insert({ name: tagName, created_by: currentUser.id })
+          .select()
+          .single();
+        tag = createdTag;
+      }
+      if (tag) {
+        await supabaseClient.from("file_hashtag").insert({ id_file: newFile.id, id_hashtag: tag.id });
+      }
+    }
+
     await logHistory(newFile.id, "Đã thêm");
 
-    showToast("Tải lên thành công", `File "${displayName}" đã được lưu.`);
+    showToast("Tải lên thành công", `File "${displayName}" đã được gắn thẻ: #${tagNames.join(", #")}`);
     document.getElementById("uploadForm").reset();
-    document.getElementById("uploadSubfolderWrap").hidden = true;
     await loadFiles();
+    await loadHashtagsAdmin();
     await loadLeaderboard();
   } catch (error) {
     showToast("Tải lên thất bại", error.message || "Vui lòng thử lại.");
@@ -751,28 +579,8 @@ async function handleUpload(event) {
   }
 }
 
-async function resolveDuplicateName(name, folderId) {
-  const { data } = await supabaseClient
-    .from("file")
-    .select("file_name")
-    .eq("id_folder", folderId)
-    .eq("id_user", currentUser.id)
-    .eq("status", true);
-
-  const existingNames = new Set((data || []).map((f) => f.file_name));
-  if (!existingNames.has(name)) return name;
-
-  let counter = 1;
-  let candidate = `${name} (${counter})`;
-  while (existingNames.has(candidate)) {
-    counter += 1;
-    candidate = `${name} (${counter})`;
-  }
-  return candidate;
-}
-
 // ==========================================================================
-// TAB: LỊCH SỬ (chỉ xem)
+// TAB: LỊCH SỬ
 // ==========================================================================
 
 async function loadHistory() {
@@ -792,7 +600,6 @@ async function loadHistory() {
   if (fileHistoryResult.error) return showToast("Không tải được lịch sử file", fileHistoryResult.error.message);
   if (adminHistoryResult.error) return showToast("Không tải được lịch sử phân quyền", adminHistoryResult.error.message);
 
-  // Gộp 2 nguồn thành 1 danh sách chung, mỗi dòng tự biết cách hiển thị chính mình
   const fileEntries = (fileHistoryResult.data || []).map((h) => ({
     time: h.created_at,
     target: h.file?.file_name || "(file đã bị xóa vĩnh viễn)",
@@ -826,7 +633,7 @@ async function loadHistory() {
 }
 
 // ==========================================================================
-// TAB: CÀI ĐẶT (site_setting - chỉ có 1 dòng duy nhất, id = 1)
+// TAB: CÀI ĐẶT
 // ==========================================================================
 
 document.getElementById("settingsForm").addEventListener("submit", handleSaveSettings);
@@ -838,7 +645,7 @@ async function loadSettings() {
     .eq("id", 1)
     .single();
 
-  if (error || !data) return; // chưa có dòng dữ liệu nào -> để trống cho Admin tự điền lần đầu
+  if (error || !data) return;
 
   document.getElementById("settingPhone").value = data.phone || "";
   document.getElementById("settingEmail").value = data.email || "";
@@ -858,7 +665,6 @@ async function handleSaveSettings(event) {
     updated_at: new Date().toISOString(),
   };
 
-  // upsert: nếu dòng id=1 chưa tồn tại thì tự tạo mới, có rồi thì cập nhật
   const { error } = await supabaseClient.from("site_setting").upsert(payload);
 
   submitBtn.disabled = false;
@@ -868,7 +674,7 @@ async function handleSaveSettings(event) {
 }
 
 // ==========================================================================
-// TAB: TÀI KHOẢN (đổi tên hiển thị / đổi mật khẩu - cần xác thực mật khẩu hiện tại)
+// TAB: TÀI KHOẢN
 // ==========================================================================
 
 document.getElementById("accountForm").addEventListener("submit", handleUpdateAccount);
@@ -917,7 +723,7 @@ async function handleUpdateAccount(event) {
 }
 
 // ==========================================================================
-// HÀM TIỆN ÍCH DÙNG CHUNG
+// HÀM TIỆN ÍCH
 // ==========================================================================
 
 function showToast(title, message) {
@@ -946,7 +752,6 @@ function escapeAttr(value = "") {
   return escapeHTML(value);
 }
 
-// ---------- TỰ ĐỘNG GẮN NÚT "HIỆN/ẨN MẬT KHẨU" VÀO MỌI Ô PASSWORD TRÊN TRANG ----------
 function enablePasswordToggles() {
   document.querySelectorAll('input[type="password"]').forEach((input) => {
     if (input.dataset.toggleAttached) return;
@@ -961,7 +766,6 @@ function enablePasswordToggles() {
     toggleBtn.type = "button";
     toggleBtn.className = "password-toggle-btn";
     toggleBtn.textContent = "👁";
-    toggleBtn.setAttribute("aria-label", "Hiện/ẩn mật khẩu");
     wrapper.appendChild(toggleBtn);
 
     toggleBtn.addEventListener("click", () => {
@@ -973,7 +777,6 @@ function enablePasswordToggles() {
 }
 enablePasswordToggles();
 
-// ---------- DARK / LIGHT MODE (lưu vào cột "color" trong bảng user) ----------
 function applyTheme(isDark) {
   document.documentElement.dataset.theme = isDark ? "dark" : "light";
 }
@@ -981,6 +784,7 @@ function applyTheme(isDark) {
 function initThemeToggle(isDark) {
   applyTheme(isDark);
   const toggle = document.getElementById("darkModeToggle");
+  if (!toggle) return;
   toggle.checked = !!isDark;
 
   toggle.addEventListener("change", async () => {
@@ -990,15 +794,16 @@ function initThemeToggle(isDark) {
   });
 }
 
-// ---------- BẢNG XẾP HẠNG: ai upload nhiều file nhất ----------
 async function loadLeaderboard() {
   const { data, error } = await supabaseClient
     .from("user")
     .select("user_name, score")
     .order("score", { ascending: false })
-    .limit(5);
+    .limit(10);
 
   const list = document.getElementById("leaderboardList");
+  if (!list) return;
+
   if (error || !data || data.length === 0) {
     list.innerHTML = `<p style="color:var(--text-sub);font-size:0.85rem;">Chưa có dữ liệu.</p>`;
     return;
@@ -1007,8 +812,8 @@ async function loadLeaderboard() {
   const medals = ["🥇", "🥈", "🥉"];
   list.innerHTML = data
     .map((u, i) => /* html */ `
-      <div style="display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0;border-bottom:1px solid var(--border-color);">
-        <span style="width:1.5rem;text-align:center;">${medals[i] || i + 1}</span>
+      <div style="display:flex;align-items:center;gap:0.75rem;padding:0.75rem 0;border-bottom:1px solid var(--border-color);">
+        <span style="width:1.5rem;text-align:center;font-weight:bold;">${medals[i] || i + 1}</span>
         <span style="flex:1;">${escapeHTML(u.user_name || "Ẩn danh")}</span>
         <strong>${u.score ?? 0} file</strong>
       </div>`)
